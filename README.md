@@ -409,6 +409,12 @@ A dedicated menu option at each NPC prompts for a character name and deletes all
 `character_tcg_redeemed` for that character, resetting their eligibility for all unique items.
 The count of cleared records is reported back as a whisper.
 
+### Mail an Item Code
+
+This functions exactly like Item Delivery does, except instead of delivering the item to the
+player's mailbox, a code and some flavor text are generated into a Default Stationery item,
+and mailed to the player so that they can redeem the item themselves in-game.
+
 ---
 
 ## Code Generator
@@ -624,6 +630,12 @@ for either target.
   `TCGVendors.BossDrop.ItemIds`, `TCGVendors.BossDrop.MailParticipants`.
 - `#include "Group.h"` and `#include "LootMgr.h"` added.
 
+### v1.2 — GM Send Item Code
+
+- `BuildGMCodeText`, `HandleGMSendCode`, `ShowExpansionListForCode`,
+  `ShowExpansionItemsForCode`, `ShowPromoCategoryListForCode`, and `ShowPromoItemsForCode` 
+  added to handle generating the custom text for the Stationery item, and the
+  new menu option to allow GM's in GM mode to send an item code to a player.
 ---
 
 ## Credits

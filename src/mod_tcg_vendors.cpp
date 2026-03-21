@@ -79,6 +79,10 @@ enum GossipSenders : uint32
     // Sender for the GM "Force re-deliver" override confirmation dialog.
     SENDER_GM_FORCE    = 16,
 
+    // Sender for the GM "Send a code to a player" browse path and final
+    // text-input submission.  Sits between force-delivery (16) and promo (18-21).
+    SENDER_GM_SEND_CODE = 17,
+
     // Promo vendor (Garel Redrock / Tharl Stonebleeder) category sub-menu senders.
     SENDER_PROMO_MURLOC  = 18,
     SENDER_PROMO_CLASSIC = 19,
@@ -86,7 +90,8 @@ enum GossipSenders : uint32
     SENDER_PROMO_EVENTS  = 21,
 
     // Action used on the root menu "Browse by expansion set" button.
-    ACTION_OPEN_BROWSE = 99,
+    ACTION_OPEN_BROWSE    = 99,
+    ACTION_OPEN_SEND_CODE = 98,   // Root "[GM] Send a code to a player..." button
 };
 
 // ============================================================
@@ -438,6 +443,161 @@ static bool IsItemConsumable(uint32 redemptionKey, bool baseConsumable)
 // ============================================================
 //  H E L P E R   F U N C T I O N S
 // ============================================================
+
+// Helper: Map itemId to vendor name
+// Helper: Map an item entry to the NPC vendor name(s) that handle it.
+//
+// Rather than maintaining a hardcoded list, we scan the three catalogs
+// directly — this stays automatically correct as catalogs change.
+//
+// Blizzcon and Promo items are sold at paired Alliance/Horde vendors;
+// we list both so the stationery is useful regardless of the reader's
+// faction.
+static std::string GetVendorForItem(uint32 itemId)
+{
+    // TCG expansion items — Landro Longshot, Booty Bay
+    for (auto const& [sender, items] : LANDRO_CATALOG)
+        for (auto const& tcgItem : items)
+            for (uint32 e : tcgItem.entries)
+                if (e == itemId)
+                    return "Landro Longshot in Booty Bay";
+
+    // Blizzcon promotional items — Ransin Donner (Alliance) / Zas'Tysh (Horde)
+    for (auto const& tcgItem : BLIZZCON_CATALOG)
+        for (uint32 e : tcgItem.entries)
+            if (e == itemId)
+                return "Ransin Donner in Ironforge (Alliance) or Zas'Tysh in Orgrimmar (Horde)";
+
+    // Additional promotional items — Garel Redrock (Alliance) / Tharl Stonebleeder (Horde)
+    for (auto const& [sender, items] : PROMO_CATALOG)
+        for (auto const& tcgItem : items)
+            for (uint32 e : tcgItem.entries)
+                if (e == itemId)
+                    return "Garel Redrock in Ironforge (Alliance) or Tharl Stonebleeder in Orgrimmar (Horde)";
+
+    // Fallback — should not be reached for any configured item
+    LOG_WARN("module",
+        "mod-tcg-vendors: GetVendorForItem: item {} not found in any catalog. "
+        "Check TCGVendors.BossDrop.ItemIds.", itemId);
+    return "the TCG vendor NPC";
+}
+
+// Helper: Get item name from item ID (fallback to numeric ID string if not found)
+static std::string GetItemName(uint32 itemId)
+{
+    if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId))
+        return proto->Name1;
+    return std::to_string(itemId);
+}
+
+// Helper: Build the flavor text message for a stationery drop
+static std::string BuildStationeryText(const std::string& bossName,
+                                       const std::string& itemName,
+                                       const std::string& code,
+                                       uint32             itemId)
+{
+    std::string vendor = GetVendorForItem(itemId);
+    return "Congratulations! You have defeated " + bossName + ".\n\n"
+           "Enclosed is a code redeemable for: " + itemName + ".\n\n"
+           "Code:\n" + code + "\n\n"
+           "To redeem this code, visit " + vendor + " and speak with the TCG vendor NPC.\n\n"
+           "This code is single-use. Thank you for playing!";
+}
+
+// Helper: Create a stationery item (9311) with text properly set for
+// in-inventory readability.
+//
+// Two things are required for the client to show an item as right-click-
+// readable and to query its text:
+//
+//   1. item_instance.text  — the actual text content, read by the server
+//      when the client queries it.  We write this directly via SQL after
+//      SaveToDB as a safety net, since Item::SetText may not be included
+//      in SaveToDB in all fork variants.
+//
+//   2. ITEM_FIELD_FLAG_READABLE (0x00000200) — set on the item's flags field.
+//      When present, the client shows the right-click-to-read option and
+//      sends CMSG_ITEM_TEXT_QUERY.  The server responds with item_instance.text
+//      looked up by the item's own GUID.  This fork has no separate
+//      ITEM_FIELD_ITEM_TEXT_ID update field; the readable flag is sufficient.
+//
+// SetText alone is insufficient without the readable flag.
+static void StampItemText(Item* item, Player* owner, const std::string& text)
+{
+    // 1. Set in-memory text — populates m_text for SaveToDB.
+    item->SetText(text);
+
+    // 2. Set ITEM_FIELD_FLAG_READABLE (0x00000200) on the item's flags field.
+    //    This is what tells the client to show the right-click-to-read option
+    //    and to send CMSG_ITEM_TEXT_QUERY.  The server responds to that query
+    //    with item_instance.text looked up by the item's GUID.
+    //    There is no separate ITEM_FIELD_ITEM_TEXT_ID in this fork.
+    item->SetFlag(ITEM_FIELD_FLAGS, ITEM_FIELD_FLAG_READABLE);
+
+    // 3. Mark dirty so the flag update is sent to the client on the next
+    //    update cycle and written to item_instance on the next autosave.
+    if (owner)
+        item->SetState(ITEM_CHANGED, owner);
+}
+
+static Item* CreateStationeryWithText(Player* owner, const std::string& text)
+{
+    Item* item = Item::CreateItem(9311, 1, owner);
+    if (!item)
+        return nullptr;
+    StampItemText(item, nullptr, text);  // no owner yet — SaveToDB will persist
+    return item;
+}
+
+// After a SaveToDB + CommitTransaction call, write the text directly to
+// item_instance.text.  This is a safety net for forks where SaveToDB does
+// not include the m_text field in its INSERT/UPDATE statement.
+static void DirectWriteItemText(uint32 itemGuidLow, const std::string& text)
+{
+    std::string escaped = text;
+    CharacterDatabase.EscapeString(escaped);
+    CharacterDatabase.Execute(
+        "UPDATE item_instance SET text = '{}' WHERE guid = {}",
+        escaped, itemGuidLow);
+}
+
+// Helper: Generate a random code (alphanumeric, 12 chars)
+static std::string GenerateRandomCode()
+{
+    static const char alphanum[] = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+    std::string raw;
+    for (int i = 0; i < 16; ++i)
+        raw += alphanum[urand(0, sizeof(alphanum) - 2)];
+    // Format as XXXX-XXXX-XXXX-XXXX
+    return raw.substr(0,4) + "-" + raw.substr(4,4) + "-" + raw.substr(8,4) + "-" + raw.substr(12,4);
+}
+
+// Helper: Find reward_group key for an itemId
+static std::string GetRewardGroupForItem(uint32 itemId)
+{
+    for (const auto& pair : REWARD_GROUPS)
+    {
+        for (uint32 entry : pair.second.itemEntries)
+        {
+            if (entry == itemId)
+                return pair.first;
+        }
+    }
+    return "";
+}
+
+// Helper: Insert code into the module's code tracking table
+static void InsertCodeToDatabase(const std::string& code, const std::string& rewardGroup)
+{
+    std::string escCode = code;
+    std::string escGroup = rewardGroup;
+    CharacterDatabase.EscapeString(escCode);
+    CharacterDatabase.EscapeString(escGroup);
+    CharacterDatabase.Execute(
+        "INSERT INTO account_tcg_codes (code, reward_group, redeemed, account_id, character_guid, redeemed_date) "
+        "VALUES ('{}', '{}', 0, NULL, NULL, NULL)",
+        escCode, escGroup);
+}
 
 static bool HasRedeemed(uint32 guid, uint32 itemEntry)
 {
@@ -1091,6 +1251,185 @@ static void HandleGMClearFlags(Player*            gm,
 }
 
 // ============================================================
+//  GM Send-Code helpers
+//
+//  "Send a code to a player" generates a fresh redemption code for a
+//  chosen item, inserts it into account_tcg_codes as unredeemed, and
+//  mails the target a readable stationery item with WoW-flavoured text
+//  containing the code and vendor directions.
+//
+//  The item is NOT delivered directly — the player redeems it at the
+//  appropriate vendor NPC using the mailed code.
+// ============================================================
+
+static std::string BuildGMCodeText(const std::string& targetName,
+                                    const std::string& itemName,
+                                    const std::string& code,
+                                    uint32             itemId)
+{
+    std::string vendor = GetVendorForItem(itemId);
+    return "Greetings, " + targetName + "!\n\n"
+           "A Game Master has arranged a special gift for you!\n\n"
+           "You have been awarded a redemption code for:\n"
+           + itemName + "\n\n"
+           "Your code:\n"
+           + code + "\n\n"
+           "To claim your reward, visit " + vendor + " and enter this code "
+           "when prompted.\n\n"
+           "This code is single-use and will be bound to your account upon "
+           "redemption.  Keep it safe!\n\n"
+           "Good luck on your adventures in Azeroth!";
+}
+
+static void HandleGMSendCode(Player*            gm,
+                              Creature*          creature,
+                              const std::string& targetName,
+                              const std::string& displayName,
+                              const std::string& rewardGroupKey,
+                              uint32             itemId)
+{
+    if (targetName.empty())
+    {
+        creature->Whisper("Please enter a character name.", LANG_UNIVERSAL, gm);
+        return;
+    }
+
+    if (REWARD_GROUPS.find(rewardGroupKey) == REWARD_GROUPS.end())
+    {
+        creature->Whisper(
+            "[GM] Unknown reward group for this item — cannot generate a code.",
+            LANG_UNIVERSAL, gm);
+        LOG_ERROR("module",
+            "mod-tcg-vendors: HandleGMSendCode: unknown reward group '{}'.",
+            rewardGroupKey);
+        return;
+    }
+
+    Player* targetPlayer = ObjectAccessor::FindPlayerByName(targetName);
+    ObjectGuid::LowType targetGuid;
+
+    if (targetPlayer)
+    {
+        targetGuid = targetPlayer->GetGUID().GetCounter();
+    }
+    else
+    {
+        std::string escapedName = targetName;
+        CharacterDatabase.EscapeString(escapedName);
+        QueryResult charResult = CharacterDatabase.Query(
+            "SELECT guid FROM characters WHERE name = '{}'", escapedName);
+        if (!charResult)
+        {
+            creature->Whisper(
+                "Character \"" + targetName + "\" was not found. "
+                "Check the spelling and try again.",
+                LANG_UNIVERSAL, gm);
+            return;
+        }
+        targetGuid = charResult->Fetch()[0].Get<uint32>();
+    }
+
+    std::string code   = GenerateRandomCode();
+    InsertCodeToDatabase(code, rewardGroupKey);
+
+    std::string text   = BuildGMCodeText(targetName, displayName, code, itemId);
+    Item*       scroll = CreateStationeryWithText(targetPlayer, text);
+    if (!scroll)
+    {
+        creature->Whisper("[GM] Failed to create stationery item.", LANG_UNIVERSAL, gm);
+        return;
+    }
+
+    uint32 scrollGuid = scroll->GetGUID().GetCounter();
+
+    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+    scroll->SaveToDB(trans);
+    MailDraft("A special reward awaits you!", "")
+        .AddItem(scroll)
+        .SendMailTo(trans,
+            targetPlayer ? MailReceiver(targetPlayer, targetGuid)
+                         : MailReceiver(targetGuid),
+            MailSender(creature));
+    CharacterDatabase.CommitTransaction(trans);
+
+    DirectWriteItemText(scrollGuid, text);
+
+    creature->Whisper(
+        "[GM] A code for \"" + displayName + "\" has been mailed to \"" +
+        targetName + "\".",
+        LANG_UNIVERSAL, gm);
+}
+
+static void ShowExpansionListForCode(Player* player, Creature* creature, uint32 npcTextId)
+{
+    ClearGossipMenuFor(player);
+    for (auto const& [senderVal, name] : EXPANSION_NAMES)
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, name, SENDER_GM_SEND_CODE, senderVal);
+    AddGossipItemFor(player, GOSSIP_ICON_CHAT, "< Back", SENDER_MAIN, 0);
+    SendGossipMenuFor(player, npcTextId, creature->GetGUID());
+}
+
+static void ShowExpansionItemsForCode(Player* player, Creature* creature,
+                                      uint32 sender, uint32 npcTextId)
+{
+    auto catalogIt = LANDRO_CATALOG.find(sender);
+    if (catalogIt == LANDRO_CATALOG.end())
+    {
+        ShowExpansionListForCode(player, creature, npcTextId);
+        return;
+    }
+    ClearGossipMenuFor(player);
+    const std::vector<TCGItem>& items = catalogIt->second;
+    for (uint32 i = 0; i < static_cast<uint32>(items.size()); ++i)
+    {
+        uint32 encoded = (sender << 8) | (i + 1);
+        AddGossipItemFor(player, GOSSIP_ICON_TRAINER,
+            "[GM] Send code: " + items[i].displayName,
+            SENDER_GM_SEND_CODE, encoded,
+            "Enter character name to send a code for \"" +
+            items[i].displayName + "\" to:",
+            0, true);
+    }
+    AddGossipItemFor(player, GOSSIP_ICON_CHAT, "< Back to set list",
+        SENDER_GM_SEND_CODE, 0);
+    SendGossipMenuFor(player, npcTextId, creature->GetGUID());
+}
+
+static void ShowPromoCategoryListForCode(Player* player, Creature* creature)
+{
+    ClearGossipMenuFor(player);
+    for (auto const& [senderVal, name] : PROMO_CATEGORY_NAMES)
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, name, SENDER_GM_SEND_CODE, senderVal);
+    AddGossipItemFor(player, GOSSIP_ICON_CHAT, "< Back", SENDER_MAIN, 0);
+    SendGossipMenuFor(player, NPC_TEXT_PROMO, creature->GetGUID());
+}
+
+static void ShowPromoItemsForCode(Player* player, Creature* creature, uint32 sender)
+{
+    auto catalogIt = PROMO_CATALOG.find(sender);
+    if (catalogIt == PROMO_CATALOG.end())
+    {
+        ShowPromoCategoryListForCode(player, creature);
+        return;
+    }
+    ClearGossipMenuFor(player);
+    const std::vector<TCGItem>& items = catalogIt->second;
+    for (uint32 i = 0; i < static_cast<uint32>(items.size()); ++i)
+    {
+        uint32 encoded = (sender << 8) | (i + 1);
+        AddGossipItemFor(player, GOSSIP_ICON_TRAINER,
+            "[GM] Send code: " + items[i].displayName,
+            SENDER_GM_SEND_CODE, encoded,
+            "Enter character name to send a code for \"" +
+            items[i].displayName + "\" to:",
+            0, true);
+    }
+    AddGossipItemFor(player, GOSSIP_ICON_CHAT, "< Back",
+        SENDER_GM_SEND_CODE, 0);
+    SendGossipMenuFor(player, NPC_TEXT_PROMO, creature->GetGUID());
+}
+
+// ============================================================
 //  n p c _ l a n d r o _ l o n g s h o t
 // ============================================================
 class npc_landro_longshot : public CreatureScript
@@ -1100,7 +1439,6 @@ public:
 
     bool OnGossipHello(Player* player, Creature* creature) override
     {
-
         ClearGossipMenuFor(player);
 
         if (player->IsGameMaster())
@@ -1113,6 +1451,9 @@ public:
                 SENDER_GM_CLEAR, 0,
                 "Enter character name to clear all TCG redemption flags:",
                 0, true);
+            AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1,
+                "[GM] Send a code to a player...",
+                SENDER_MAIN, ACTION_OPEN_SEND_CODE);
             SendGossipMenuFor(player, NPC_TEXT_LANDRO, creature->GetGUID());
             return true;
         }
@@ -1180,6 +1521,30 @@ public:
                                      items[idx].displayName,
                                      true /* forceOverride */);
                     ShowExpansionItems(player, creature, origSender, NPC_TEXT_LANDRO);
+                    return true;
+                }
+            }
+            CloseGossipMenuFor(player);
+            return false;
+        }
+
+        // GM send-code path: generate a code and mail stationery to target.
+        if (sender == SENDER_GM_SEND_CODE)
+        {
+            uint32 origSender = (action >> 8) & 0xFF;
+            uint32 origAction = action & 0xFF;
+            auto catalogIt = LANDRO_CATALOG.find(origSender);
+            if (catalogIt != LANDRO_CATALOG.end())
+            {
+                uint32 idx = origAction - 1;
+                const std::vector<TCGItem>& items = catalogIt->second;
+                if (idx < static_cast<uint32>(items.size()))
+                {
+                    HandleGMSendCode(player, creature, codeStr,
+                        items[idx].displayName,
+                        items[idx].rewardGroupKey,
+                        items[idx].entries[0]);
+                    ShowExpansionItemsForCode(player, creature, origSender, NPC_TEXT_LANDRO);
                     return true;
                 }
             }
@@ -1279,6 +1644,12 @@ public:
                 return true;
             }
 
+            if (action == ACTION_OPEN_SEND_CODE)
+            {
+                ShowExpansionListForCode(player, creature, NPC_TEXT_LANDRO);
+                return true;
+            }
+
             if (action == 0)
             {
                 OnGossipHello(player, creature);
@@ -1286,6 +1657,16 @@ public:
             }
 
             ShowExpansionItems(player, creature, action, NPC_TEXT_LANDRO);
+            return true;
+        }
+
+        // Send-code browse tree navigation.
+        if (sender == SENDER_GM_SEND_CODE)
+        {
+            if (action == 0)
+                ShowExpansionListForCode(player, creature, NPC_TEXT_LANDRO);
+            else
+                ShowExpansionItemsForCode(player, creature, action, NPC_TEXT_LANDRO);
             return true;
         }
 
@@ -1339,6 +1720,15 @@ public:
                 SENDER_GM_CLEAR, 0,
                 "Enter character name to clear all TCG redemption flags:",
                 0, true);
+            for (uint32 i = 0; i < static_cast<uint32>(BLIZZCON_CATALOG.size()); ++i)
+            {
+                AddGossipItemFor(player, GOSSIP_ICON_TRAINER,
+                    "[GM] Send code: " + BLIZZCON_CATALOG[i].displayName,
+                    SENDER_GM_SEND_CODE, i + 1,
+                    "Enter character name to send a code for \"" +
+                    BLIZZCON_CATALOG[i].displayName + "\" to:",
+                    0, true);
+            }
             SendGossipMenuFor(player, NPC_TEXT_BLIZZCON, creature->GetGUID());
             return true;
         }
@@ -1409,6 +1799,24 @@ public:
                                  consumable,
                                  BLIZZCON_CATALOG[idx].displayName,
                                  true /* forceOverride */);
+                OnGossipHello(player, creature);
+                return true;
+            }
+            CloseGossipMenuFor(player);
+            return false;
+        }
+
+        // GM send-code path for Blizzcon items.
+        // action is 1-based item index directly (no expansion encoding needed).
+        if (sender == SENDER_GM_SEND_CODE)
+        {
+            uint32 idx = action - 1;
+            if (idx < static_cast<uint32>(BLIZZCON_CATALOG.size()))
+            {
+                HandleGMSendCode(player, creature, codeStr,
+                    BLIZZCON_CATALOG[idx].displayName,
+                    BLIZZCON_CATALOG[idx].rewardGroupKey,
+                    BLIZZCON_CATALOG[idx].entries[0]);
                 OnGossipHello(player, creature);
                 return true;
             }
@@ -1595,6 +2003,9 @@ public:
                 "[GM] Browse and deliver promotional items...",
                 SENDER_MAIN, ACTION_OPEN_BROWSE);
             AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1,
+                "[GM] Send a code to a player...",
+                SENDER_MAIN, ACTION_OPEN_SEND_CODE);
+            AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1,
                 "[GM] Clear character redemption flags",
                 SENDER_GM_CLEAR, 0,
                 "Enter character name to clear all TCG redemption flags:",
@@ -1659,6 +2070,31 @@ public:
                                      items[idx].displayName,
                                      true /* forceOverride */);
                     ShowPromoItems(player, creature, origSender);
+                    return true;
+                }
+            }
+            CloseGossipMenuFor(player);
+            return false;
+        }
+
+        // GM send-code path for promo items.
+        // action encodes (categorySender << 8) | itemIndex.
+        if (sender == SENDER_GM_SEND_CODE)
+        {
+            uint32 origSender = (action >> 8) & 0xFF;
+            uint32 origAction = action & 0xFF;
+            auto catalogIt = PROMO_CATALOG.find(origSender);
+            if (catalogIt != PROMO_CATALOG.end())
+            {
+                uint32 idx = origAction - 1;
+                const std::vector<TCGItem>& items = catalogIt->second;
+                if (idx < static_cast<uint32>(items.size()))
+                {
+                    HandleGMSendCode(player, creature, codeStr,
+                        items[idx].displayName,
+                        items[idx].rewardGroupKey,
+                        items[idx].entries[0]);
+                    ShowPromoItemsForCode(player, creature, origSender);
                     return true;
                 }
             }
@@ -1748,7 +2184,25 @@ public:
                 return true;
             }
 
+            if (action == ACTION_OPEN_SEND_CODE)
+            {
+                ShowPromoCategoryListForCode(player, creature);
+                return true;
+            }
+
             ShowPromoItems(player, creature, action);
+            return true;
+        }
+
+        // Send-code browse tree navigation.
+        if (sender == SENDER_GM_SEND_CODE)
+        {
+            if (action == 0)
+                ShowPromoCategoryListForCode(player, creature);
+            else if (PROMO_CATALOG.find(action) != PROMO_CATALOG.end())
+                ShowPromoItemsForCode(player, creature, action);
+            else
+                ShowPromoCategoryListForCode(player, creature);
             return true;
         }
 
@@ -1848,163 +2302,6 @@ static int GetBossDropMailMode()
         return 0;
     }
     return mode;
-}
-// ============================================================
-
-// Helper: Generate a random code (alphanumeric, 12 chars)
-static std::string GenerateRandomCode()
-{
-    static const char alphanum[] = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-    std::string raw;
-    for (int i = 0; i < 16; ++i)
-        raw += alphanum[urand(0, sizeof(alphanum) - 2)];
-    // Format as XXXX-XXXX-XXXX-XXXX
-    return raw.substr(0,4) + "-" + raw.substr(4,4) + "-" + raw.substr(8,4) + "-" + raw.substr(12,4);
-}
-
-// Helper: Find reward_group key for an itemId
-static std::string GetRewardGroupForItem(uint32 itemId)
-{
-    for (const auto& pair : REWARD_GROUPS)
-    {
-        for (uint32 entry : pair.second.itemEntries)
-        {
-            if (entry == itemId)
-                return pair.first;
-        }
-    }
-    return "";
-}
-
-// Helper: Insert code into the module's code tracking table for boss drops
-static void InsertCodeToDatabase(const std::string& code, const std::string& rewardGroup)
-{
-    std::string escCode = code;
-    std::string escGroup = rewardGroup;
-    CharacterDatabase.EscapeString(escCode);
-    CharacterDatabase.EscapeString(escGroup);
-    CharacterDatabase.Execute(
-        "INSERT INTO account_tcg_codes (code, reward_group, redeemed, account_id, character_guid, redeemed_date) "
-        "VALUES ('{}', '{}', 0, NULL, NULL, NULL)",
-        escCode, escGroup);
-}
-
-
-// Helper: Map itemId to vendor name
-// Helper: Map an item entry to the NPC vendor name(s) that handle it.
-//
-// Rather than maintaining a hardcoded list, we scan the three catalogs
-// directly — this stays automatically correct as catalogs change.
-//
-// Blizzcon and Promo items are sold at paired Alliance/Horde vendors;
-// we list both so the stationery is useful regardless of the reader's
-// faction.
-static std::string GetVendorForItem(uint32 itemId)
-{
-    // TCG expansion items — Landro Longshot, Booty Bay
-    for (auto const& [sender, items] : LANDRO_CATALOG)
-        for (auto const& tcgItem : items)
-            for (uint32 e : tcgItem.entries)
-                if (e == itemId)
-                    return "Landro Longshot in Booty Bay";
-
-    // Blizzcon promotional items — Ransin Donner (Alliance) / Zas'Tysh (Horde)
-    for (auto const& tcgItem : BLIZZCON_CATALOG)
-        for (uint32 e : tcgItem.entries)
-            if (e == itemId)
-                return "Ransin Donner in Ironforge (Alliance) or Zas'Tysh in Orgrimmar (Horde)";
-
-    // Additional promotional items — Garel Redrock (Alliance) / Tharl Stonebleeder (Horde)
-    for (auto const& [sender, items] : PROMO_CATALOG)
-        for (auto const& tcgItem : items)
-            for (uint32 e : tcgItem.entries)
-                if (e == itemId)
-                    return "Garel Redrock in Ironforge (Alliance) or Tharl Stonebleeder in Orgrimmar (Horde)";
-
-    // Fallback — should not be reached for any configured item
-    LOG_WARN("module",
-        "mod-tcg-vendors: GetVendorForItem: item {} not found in any catalog. "
-        "Check TCGVendors.BossDrop.ItemIds.", itemId);
-    return "the TCG vendor NPC";
-}
-
-// Helper: Get item name from item ID (fallback to numeric ID string if not found)
-static std::string GetItemName(uint32 itemId)
-{
-    if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId))
-        return proto->Name1;
-    return std::to_string(itemId);
-}
-
-// Helper: Build the flavor text message for a stationery drop
-static std::string BuildStationeryText(const std::string& bossName,
-                                       const std::string& itemName,
-                                       const std::string& code,
-                                       uint32             itemId)
-{
-    std::string vendor = GetVendorForItem(itemId);
-    return "Congratulations! You have defeated " + bossName + ".\n\n"
-           "Enclosed is a code redeemable for: " + itemName + ".\n\n"
-           "Code:\n" + code + "\n\n"
-           "To redeem this code, visit " + vendor + " and speak with the TCG vendor NPC.\n\n"
-           "This code is single-use. Thank you for playing!";
-}
-
-// Helper: Create a stationery item (9311) with text properly set for
-// in-inventory readability.
-//
-// Two things are required for the client to show an item as right-click-
-// readable and to query its text:
-//
-//   1. item_instance.text  — the actual text content, read by the server
-//      when the client queries it.  We write this directly via SQL after
-//      SaveToDB as a safety net, since Item::SetText may not be included
-//      in SaveToDB in all fork variants.
-//
-//   2. ITEM_FIELD_FLAG_READABLE (0x00000200) — set on the item's flags field.
-//      When present, the client shows the right-click-to-read option and
-//      sends CMSG_ITEM_TEXT_QUERY.  The server responds with item_instance.text
-//      looked up by the item's own GUID.  This fork has no separate
-//      ITEM_FIELD_ITEM_TEXT_ID update field; the readable flag is sufficient.
-//
-// SetText alone is insufficient without the readable flag.
-static void StampItemText(Item* item, Player* owner, const std::string& text)
-{
-    // 1. Set in-memory text — populates m_text for SaveToDB.
-    item->SetText(text);
-
-    // 2. Set ITEM_FIELD_FLAG_READABLE (0x00000200) on the item's flags field.
-    //    This is what tells the client to show the right-click-to-read option
-    //    and to send CMSG_ITEM_TEXT_QUERY.  The server responds to that query
-    //    with item_instance.text looked up by the item's GUID.
-    //    There is no separate ITEM_FIELD_ITEM_TEXT_ID in this fork.
-    item->SetFlag(ITEM_FIELD_FLAGS, ITEM_FIELD_FLAG_READABLE);
-
-    // 3. Mark dirty so the flag update is sent to the client on the next
-    //    update cycle and written to item_instance on the next autosave.
-    if (owner)
-        item->SetState(ITEM_CHANGED, owner);
-}
-
-static Item* CreateStationeryWithText(Player* owner, const std::string& text)
-{
-    Item* item = Item::CreateItem(9311, 1, owner);
-    if (!item)
-        return nullptr;
-    StampItemText(item, nullptr, text);  // no owner yet — SaveToDB will persist
-    return item;
-}
-
-// After a SaveToDB + CommitTransaction call, write the text directly to
-// item_instance.text.  This is a safety net for forks where SaveToDB does
-// not include the m_text field in its INSERT/UPDATE statement.
-static void DirectWriteItemText(uint32 itemGuidLow, const std::string& text)
-{
-    std::string escaped = text;
-    CharacterDatabase.EscapeString(escaped);
-    CharacterDatabase.Execute(
-        "UPDATE item_instance SET text = '{}' WHERE guid = {}",
-        escaped, itemGuidLow);
 }
 
 // ============================================================
