@@ -19,8 +19,8 @@ boss kills and delivers them to players as readable in-game stationery.
 
 Landro Longshot, Ransin Donner, and Zas'Tysh exist in the default AzerothCore database as
 stubs with no item delivery logic. Garel Redrock and Tharl Stonebleeder are their counterpart
-NPCs — Tharl is present in the 3.3.5a client data, while Garel is a custom spawn that
-completes the Alliance side. This module brings all five NPCs to life with configurable
+NPCs Ian Drake and Edward Cairn, in Stormwind and Undercity respectively, are solely responsible for the vending
+ of Tyrael's hilt, a Blizzard WorldWide Invitational item. This module brings all seven NPCs to life with configurable
 redemption modes, correct item entry IDs, a full GM delivery and management toolset, as well as an
 automated boss drop system.
 
@@ -267,7 +267,7 @@ mysql -u root -p acore_characters < sql/characters/base/create_tcg_redeemed_tabl
 mysql -u root -p acore_characters < sql/characters/base/create_tcg_codes_table.sql
 ```
 
-**World database** — sets `ScriptName` on the five NPC entries, adds NPC greeting texts,
+**World database** — sets `ScriptName` on the seven NPC entries, adds NPC greeting texts,
 ensures the gossip flag is set on each NPC, and handles all creature spawns:
 
 ```bash
@@ -276,6 +276,8 @@ mysql -u root -p acore_world < sql/world/base/zzz_tcg_vendors_setup.sql
 
 The world SQL handles the following automatically — no manual in-game steps required:
 - Spawns **Garel Redrock** in The Forlorn Cavern next to Ransin Donner
+- Spawns **Edward Cairn** in The Undercity
+- Spawns **Ian Drake** in Stormwind
 - Spawns a **Gurky** companion murloc next to Garel, mirroring Tharl and Gurky in Orgrimmar
 - Repositions **Murky** in Ironforge to stand next to Ransin Donner in the correct orientation
 
@@ -332,7 +334,7 @@ All options live in `mod-tcg-vendors.conf`.
 
 ### `TCGVendors.Mode`
 
-Controls the overall behaviour of all five NPCs.
+Controls the overall behaviour of all seven NPCs.
 
 | Value | Behaviour |
 |-------|-----------|
@@ -407,7 +409,7 @@ tables always mirror the config file.
 
 ## GM Tools
 
-Game Masters with GM mode active (`.gm on`) receive a special menu at all five NPCs in every
+Game Masters with GM mode active (`.gm on`) receive a special menu at all seven NPCs in every
 operation mode, including Mode 0. GMs playing without GM mode active see the same menu as
 regular players.
 
