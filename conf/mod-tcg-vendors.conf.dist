@@ -146,6 +146,38 @@ TCGVendors.BossDrop.Enabled = 0
 #    Removing an entry from this list does NOT delete existing loot template
 #    rows — remove those manually from creature_loot_template if desired.
 #
+#    The following is a list of all Raid boss ID's, followed by a string of all the ID's for use in the config
+#
+#    10184	Onyxia (Level 80)
+#    11502	Ragnaros
+#    11583	Nefarian
+#    14834	Hakkar
+#    15339	Ossirian the Unscarred
+#    15690	Prince Malchezaar
+#    15727	C'Thun
+#    15990	Kel'Thuzad (Level 80)
+#    17257	Magtheridon
+#    17968	Archimonde
+#    19044	Gruul the Dragonkiller
+#    19622	Kael'thas Sunstrider
+#    21212	Lady Vashj
+#    22917	Illidan Stormrage
+#    23863	Zul'jin
+#    24664	Kael'thas Sunstrider
+#    25315	Kil'jaeden
+#    28860	Sartharion
+#    29120	Anub'arak
+#    33288	Yogg-Saron
+#    34564	Anub'arak
+#    36597	The Lich King
+#    
+#    -- Individual Progression module variants
+#    301000	Onyxia (Level 60)
+#    351019	Kel'Thuzad (Level 60)
+#    
+#    -- Config string:
+#    10184, 11502, 11583, 14834, 15339, 15690, 15727, 15990, 17257, 17968, 19044, 19622, 21212, 22917, 23863, 24664, 25315, 28860, 29120, 33288, 34564, 36597, 301000, 351019
+#
 #    Example: TCGVendors.BossDrop.CreatureIds = 11502,15990,36597
 #
 #    Default: (empty — no bosses configured)
