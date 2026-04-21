@@ -2353,6 +2353,23 @@ static int GetBossDropMailMode()
 }
 
 // ============================================================
+//  Boss Drop Rate
+//
+//  Returns the configured drop rate percentage (1-100)
+// ============================================================
+int GetBossDropRate()
+{
+    int rate = sConfigMgr->GetOption<int>("TCGVendors.BossDrop.DropRate", 100);
+    if (rate < 1 || rate > 100)
+    {
+        LOG_WARN("module",
+            "mod-tcg-vendors: TCGVendors.BossDrop.DropRate has invalid value {} — falling back to 100.", rate);
+        return 100;
+    }
+    return rate;
+}
+
+// ============================================================
 //  Boss Drop State
 //
 //  Keyed by creature entry ID.  Written in OnPlayerCreatureKill,
@@ -2562,6 +2579,7 @@ public:
         }
 
         int mailMode = GetBossDropMailMode();
+        int dropRate = GetBossDropRate();
         auto bossIds = GetBossDropCreatureIds();
 
         // MailParticipants = 1 (mail only): no loot rows needed — stationery
@@ -2583,16 +2601,16 @@ public:
         }
 
         // MailParticipants = 0 or 2: stationery appears on the corpse.
-        // Insert one row per configured boss at 100% drop chance.
+        // Insert one row per configured boss at configured drop rate.
         for (uint32 bossEntry : bossIds)
         {
             WorldDatabase.Execute(
                 "INSERT INTO creature_loot_template "
                 "(Entry, Item, Reference, Chance, QuestRequired, LootMode, GroupId, MinCount, MaxCount, Comment) "
-                "VALUES ({}, 9311, 0, 100, 0, 1, 0, 1, 1, 'TCG code scroll — mod-tcg-vendors')",
-                bossEntry);
+                "VALUES ({}, 9311, 0, {}, 0, 1, 0, 1, 1, 'TCG code scroll — mod-tcg-vendors')",
+                bossEntry, dropRate);
             LOG_INFO("module",
-                "mod-tcg-vendors: Registered stationery drop for boss entry {}.", bossEntry);
+                "mod-tcg-vendors: Registered stationery drop ({}% chance) for boss entry {}.", bossEntry, dropRate);
         }
 
         LoadLootTemplates_Creature();
